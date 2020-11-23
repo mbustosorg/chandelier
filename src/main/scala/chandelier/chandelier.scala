@@ -5,20 +5,27 @@ import java.util.{Observable, Observer}
 
 import chandelier.VideoProcessor.startSec
 import com.illposed.osc.messageselector.OSCPatternAddressMessageSelector
-import com.illposed.osc.{MessageSelector, OSCMessageEvent, OSCMessageListener}
+import com.illposed.osc.{OSCMessageEvent, OSCMessageListener}
 import org.jcodec.api.FrameGrab
 import org.jcodec.common.io.NIOUtils
-import org.jcodec.common.model.Picture
+import org.jcodec.common.model.{ColorSpace, Picture}
+import org.jcodec.scale.ColorUtil
 
 
 class TestObserver extends Observer {
   var hasStrips = false
 
   override def update(registry: Observable, updatedDevice: Any): Unit = {
-    println("Registry changed!")
     if (updatedDevice != null) println("Device change: " + updatedDevice)
     this.hasStrips = true
   }
+}
+
+object DisplayMode extends Enumeration {
+  type Main = Value
+
+  val VIDEO = Value("VIDEO")
+  val RGB = Value("RGB")
 }
 
 object PixelTest extends App {
@@ -41,6 +48,7 @@ object PixelTest extends App {
   val OvercastSky = ColorForTemp(201, 226, 255)
   val ClearBlueSky = ColorForTemp(64, 156, 255)
 
+  var mode: DisplayMode.Value = DisplayMode.VIDEO
   var red = 1.0
   var green = 1.0
   var blue = 1.0
@@ -50,23 +58,44 @@ object PixelTest extends App {
     registry.addObserver (testObserver_1)
   }
 
-  val file = new File("/Users/mauricio/Downloads/water540.mp4")
-  val grab = FrameGrab.createFrameGrab(NIOUtils.readableChannel(file))
+  val file = new File("/Users/mauricio/Downloads/water540_new2.mp4")
+  var grab = FrameGrab.createFrameGrab(NIOUtils.readableChannel(file))
   grab.seekToSecondPrecise(startSec)
 
-  def nextFrame(): Array[Array[Byte]] = {
-    val picture: Picture = grab.getNativeFrame
-    picture.getData
+  def newGrab(): Picture = {
+    val file = new File("/Users/mauricio/Downloads/water540_new2.mp4")
+    grab = FrameGrab.createFrameGrab (NIOUtils.readableChannel (file) )
+    grab.seekToSecondPrecise (startSec)
+    grab.getNativeFrame
   }
 
-  protected def colorCalc(x: Double, y: Double, z: Double, a: Double): Int = {
+  val transform = ColorUtil.getTransform(ColorSpace.YUV420, ColorSpace.RGB)
+
+  def nextFrame(): Array[Array[Byte]] = {
+
+    val picture = {
+      try {
+        val result = grab.getNativeFrame
+        if (result == null) newGrab else result
+      } catch {
+        case _: Throwable => newGrab
+      }
+    }
+    if (picture.getColor != ColorSpace.RGB) {
+      val rgb = Picture.create(picture.getWidth, picture.getHeight, ColorSpace.RGB)
+      transform.transform(picture, rgb)
+      rgb.getData
+    } else {
+      picture.getData
+    }
+  }
+
+  protected def colorCalc(x: Double, y: Double, z: Double, a: Double, colorMode: String): Int = {
 
     val colorModeX = 255.0
     val colorModeY = 255.0
     val colorModeZ = 255.0
     val colorModeA = 255.0
-    //val colorMode = "HSB"
-    val colorMode = "RGB"
     val colorModeScale = true
 
     var calcR = x.min(colorModeX).max(0.0)
@@ -141,36 +170,23 @@ object PixelTest extends App {
   def draw (): Unit = {
     if (testObserver_1.hasStrips) {
       registry.startPushing
+      val nextData: Array[Array[Byte]] = nextFrame
       val strips = registry.getStrips
       var stripy = 0
       val yscale = 100 / strips.size
-/*
-      if (red < 255.0 && red >= 0.0) {
-        red += 1
-        green = 0.0
-        blue = 0.0
-      } else if (green < 255.0 && green >= 0.0) {
-        red = 0.0
-        green += 1
-        blue = 0.0
-      } else if (blue < 255.0 && blue >= 0.0) {
-        red = 0.0
-        green = 0.0
-        blue += 1
-      } else red = 0.0
-*/
-      hue += 1.0
-      if (hue > 255.0) {hue = 0.0}
       for (strip <- strips.asScala) {
         val xscale = 100 / strip.getLength
         var stripx = 0
-        while ( {
-          stripx < strip.getLength
-        }) {
-          //strip.setPixel (colorCalc(hue, 255.0, 255.0, 255.0), stripx)
-          strip.setPixel (colorCalc(red, green, blue, 255.0), stripx)
-          stripx += 1
-          stripx - 1
+        for (stripx <- 0 to strip.getLength - 1) {
+          //strip.setPixel (colorCalc(hue, 255.0, 255.0, 255.0, "HSB"), stripx)
+          if (mode == DisplayMode.VIDEO) {
+            val red = (nextData(0)(stripx * 3 + 0) + 128).asInstanceOf[Float]
+            val green = (nextData(0)(stripx * 3 + 1) + 128).asInstanceOf[Float]
+            val blue = (nextData(0)(stripx * 3 + 2) + 128).asInstanceOf[Float]
+            strip.setPixel(colorCalc(red, green, blue, 255.0, "RGB"), stripx)
+          } else {
+            strip.setPixel(colorCalc(red, green, blue, 255.0, "RGB"), stripx)
+          }
         }
         stripy += 1
       }
@@ -184,24 +200,78 @@ object PixelTest extends App {
     override def acceptMessage(event: OSCMessageEvent): Unit = {
       if (event.getMessage.getAddress == "/red") {
         red = event.getMessage.getArguments.get(0).asInstanceOf[Float]
+        mode = DisplayMode.RGB
       } else if (event.getMessage.getAddress == "/green") {
         green = event.getMessage.getArguments.get(0).asInstanceOf[Float]
+        mode = DisplayMode.RGB
       } else if (event.getMessage.getAddress == "/blue") {
         blue = event.getMessage.getArguments.get(0).asInstanceOf[Float]
+        mode = DisplayMode.RGB
+      } else if (event.getMessage.getAddress == "/lamp") {
+        mode = DisplayMode.RGB
+        val index = event.getMessage.getArguments.get(0).asInstanceOf[Float].toInt
+        index match {
+          case 0 => {
+            red = Candle.red
+            green = Candle.green
+            blue = Candle.blue
+          }
+          case 1 => {
+            red = W40Tungsten.red
+            green = W40Tungsten.green
+            blue = W40Tungsten.blue
+          }
+          case 2 => {
+            red = W100Tungsten.red
+            green = W100Tungsten.green
+            blue = W100Tungsten.blue
+          }
+          case 3 => {
+            red = Halogen.red
+            green = Halogen.green
+            blue = Halogen.blue
+          }
+          case 4 => {
+            red = CarbonArc.red
+            green = CarbonArc.green
+            blue = CarbonArc.blue
+          }
+          case 5 => {
+            red = HighNoon.red
+            green = HighNoon.green
+            blue = HighNoon.blue
+          }
+          case 6 => {
+            red = DirectSunlight.red
+            green = DirectSunlight.green
+            blue = DirectSunlight.blue
+          }
+          case 7 => {
+            red = OvercastSky.red
+            green = OvercastSky.green
+            blue = OvercastSky.blue
+          }
+          case 8 => {
+            red = ClearBlueSky.red
+            green = ClearBlueSky.green
+            blue = ClearBlueSky.blue
+          }
+        }
+      } else if (event.getMessage.getAddress == "/video") {
+        mode = DisplayMode.VIDEO
       }
     }
   }
-  val selector_red: MessageSelector = new OSCPatternAddressMessageSelector("/red")
-  val selector_green: MessageSelector = new OSCPatternAddressMessageSelector("/green")
-  val selector_blue: MessageSelector = new OSCPatternAddressMessageSelector("/blue")
-  receiver.getDispatcher.addListener(selector_red, listener)
-  receiver.getDispatcher.addListener(selector_green, listener)
-  receiver.getDispatcher.addListener(selector_blue, listener)
+  receiver.getDispatcher.addListener(new OSCPatternAddressMessageSelector("/red"), listener)
+  receiver.getDispatcher.addListener(new OSCPatternAddressMessageSelector("/green"), listener)
+  receiver.getDispatcher.addListener(new OSCPatternAddressMessageSelector("/blue"), listener)
+  receiver.getDispatcher.addListener(new OSCPatternAddressMessageSelector("/lamp"), listener)
+  receiver.getDispatcher.addListener(new OSCPatternAddressMessageSelector("/video"), listener)
   receiver.startListening
 
   setup()
   while(true) {
-    Thread.sleep(50)
+    Thread.sleep(16)
     draw()
   }
 }
